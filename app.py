@@ -61,17 +61,17 @@ def format_rupiah(price: float) -> str:
 
 def post_process_narrative(narrative: str) -> str:
     """Finds all currency values in the narrative and formats them."""
-    # FIX: This regex was too greedy. The new one looks for "Rp" followed by digits,
-    # ensuring it doesn't accidentally merge numbers.
+    # FIX: This regex is now more robust. It correctly captures integers and decimals,
+    # handles existing separators, and prevents incorrect re-formatting.
     def replacer(match):
         try:
-            # Remove thousand separators, then convert to float
-            number_str = match.group(1).replace(".", "").replace(",", "")
+            # Remove thousand separators (dots), change decimal comma to dot, then convert to float.
+            number_str = match.group(1).replace(".", "").replace(",", ".")
             number = float(number_str)
             return format_rupiah(number)
         except (ValueError, IndexError):
             return match.group(0) # Return original match if conversion fails
-    return re.sub(r'Rp\s*([\d.,]+)', replacer, narrative)
+    return re.sub(r'Rp\s*([\d,.]+\d)', replacer, narrative)
 # --- Helper Function to Render the Dashboard-in-a-Bubble ---
 
 
@@ -144,10 +144,14 @@ def render_dashboard_response(response_json: dict, user_query: str):
 
     col3, col4 = st.columns(2)
     with col3:
-        st.metric(label="P/E Ratio", value=f"{pe_ratio:.2f}x")
+        # FIX: Check for None before formatting to prevent crashes.
+        pe_value = f"{pe_ratio:.2f}x" if pe_ratio is not None else "N/A"
+        st.metric(label="P/E Ratio", value=pe_value)
     with col4:
+        # FIX: Check for None before formatting.
+        mc_value = f"Rp {market_cap:.2f} T" if market_cap is not None else "N/A"
         st.metric(label="Market Cap (IDR)",
-                    value=f"Rp {market_cap:.2f} T")
+                    value=mc_value)
 
 
 # --- Main App ---
@@ -160,7 +164,7 @@ st.title("FinAI IDX Stock Advisor 🇮🇩")
 # 2. Initialize Session State for chat history
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        AIMessage(content="Hello! I am your AI-powered IDX analyst. How can I help you today? (e.g., 'Analyze my position in BBCA. I bought at Rp 9,250')")
+        AIMessage(content="Hello! I am your AI-powered IDX analyst. How can I help you today? (e.g., 'Analyze my position in a stock. I bought at Rp 9,250')")
     ]
 
 # 3. Display Chat History
@@ -216,9 +220,10 @@ if prompt := st.chat_input("Analyze BBCA, compare BBCA and BBRI, or ask a questi
                     response_content = str(result)
 
             except Exception as e:
-                # Revert to showing a generic message in the chat, but keep the detailed error in the log/red box.
-                st.error(f"Error invoking agent: {e}")
-                response_content = "Sorry, I encountered an error while trying to process your request."
+                # Display the actual error message in the chat for debugging purposes.
+                error_message = f"Sorry, I encountered an error while trying to process your request:\n\n```\n{e}\n```"
+                st.error(error_message) # Show the error in a prominent red box
+                response_content = error_message # Also put the error in the chat bubble
 
             # Add the full AI response (JSON or text) to history
             st.session_state.messages.append(

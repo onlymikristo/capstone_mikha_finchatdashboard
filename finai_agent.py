@@ -131,12 +131,15 @@ def parse_ticker_from_input(x: dict) -> str:
 
 def parse_two_tickers(x: dict) -> dict:
     """A simple parser to find two stock tickers for comparison."""
-    tickers = re.findall(r'\b[A-Z]{4}\b', x["input"].upper())
-    
-    tickers.extend(["BBCA", "BBRI"]) # Add defaults if not enough tickers were found
+    # FIX: This logic is now robust. It finds unique tickers and only adds defaults if needed.
+    # This prevents the agent from trying to compare a stock with itself, which causes hallucinations.
+    found_tickers = list(dict.fromkeys(re.findall(r'\b[A-Z]{4}\b', x["input"].upper()))) # Find unique tickers
+    default_tickers = ["BBCA", "BBRI"]
+    while len(found_tickers) < 2:
+        found_tickers.append(default_tickers.pop(0))
     return {
-        "ticker_1": tickers[0],
-        "ticker_2": tickers[1],
+        "ticker_1": found_tickers[0],
+        "ticker_2": found_tickers[1],
         "input": x["input"]
     }
 
@@ -146,29 +149,29 @@ def parse_two_tickers(x: dict) -> dict:
 # --- Chain 1: Single Stock Analysis ---
 
 # Data-gathering part
+# This chain now takes the full context, adds the ticker and financials to the 'passthrough' key.
 data_gathering_chain = (
-    (lambda x: x['passthrough'])
-    | RunnablePassthrough.assign(ticker=parse_ticker_from_input) # Find the ticker first
-    # The tool will now be called directly. If the ticker is invalid, the tool itself will return an error.
-    | RunnablePassthrough.assign(financials=lambda y: get_financial_data.invoke(y['ticker']))
+    RunnablePassthrough.assign(
+        passthrough=lambda x: x['passthrough'] | {'ticker': parse_ticker_from_input(x['passthrough'])}
+    )
+    | RunnablePassthrough.assign(
+        passthrough=lambda x: x['passthrough'] | {'financials': get_financial_data.invoke(x['passthrough']['ticker'])}
+    )
 )
 
 # Prepares the small context for the LLM
+# This now correctly reads from the 'passthrough' object.
 prepare_for_synthesis = RunnableParallel(
-    input=lambda x: x["input"],
-    chart_data_json=lambda x: x["financials"]["chart_data_for_client"],
-    analytics=lambda x: {
-        "analytics_summary": x["financials"]["analytics_summary"],
-        "fundamentals": x["financials"]["fundamentals"]
-    }
+    input=lambda x: x["passthrough"]["input"],
+    analytics=lambda x: x["passthrough"]["financials"]["analytics_summary"]
 )
 
 # Synthesis part
 synthesis_prompt = ChatPromptTemplate.from_template(synthesis_prompt_template)
 synthesis_chain = RunnableParallel(
     llm_analysis=prepare_for_synthesis | synthesis_prompt | llm | JsonOutputParser(),
-    chart_data_json=lambda x: x["financials"]["chart_data_for_client"],
-    fundamentals=lambda x: x["financials"]["fundamentals"]
+    chart_data_json=lambda x: x["passthrough"]["financials"]["chart_data_for_client"],
+    fundamentals=lambda x: x["passthrough"]["financials"]["fundamentals"]
 )
 
 # Final formatting step
@@ -183,12 +186,12 @@ def format_analysis_output(result_json: dict) -> dict:
 
 # The complete single-stock analysis chain
 stock_analysis_chain = data_gathering_chain | RunnableBranch(
-    # Condition: Check if the 'financials' key contains an error dictionary.
-    (lambda x: isinstance(x, dict) and "error" in x.get("financials", {}),
+    # Condition: Check if the 'financials' key inside 'passthrough' contains an error.
+    (lambda x: "error" in x.get("passthrough", {}).get("financials", {}),
      # If True: Return a user-friendly error message.
-     RunnableLambda(lambda x: f"Sorry, I could not retrieve data for the ticker '{x.get('ticker', '')}'. The API returned an error: {x['financials']['error']}")),
+     RunnableLambda(lambda x: f"Sorry, I could not retrieve data for the ticker '{x['passthrough'].get('ticker', '')}'. The API returned an error: {x['passthrough']['financials']['error']}")),
     # If False (default): Proceed with the normal analysis flow.
-    prepare_for_synthesis | synthesis_chain | format_analysis_output
+    synthesis_chain | format_analysis_output
 )
 
 
@@ -244,9 +247,9 @@ branch = RunnableBranch(
 
 # The full chain that includes the router and the branch
 full_chain = RunnableParallel(
-    # FIX: Isolate the router. It should only see the current user input, not the chat history.
-    # This prevents the router from getting confused by previous complex outputs.
-    intent=RunnableLambda(lambda x: {"input": x["input"]}) | router,
+    # FIX: The 'intent' key was missing. This restores the router to the chain.
+    # The router runs in parallel to the passthrough.
+    intent=router,
     passthrough=RunnablePassthrough()
 ) | RunnableLambda(
     lambda x: branch.invoke(x)

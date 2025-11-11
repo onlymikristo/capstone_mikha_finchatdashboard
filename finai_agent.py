@@ -119,31 +119,53 @@ llm = ChatGroq(
 # Unpack the tools for easier access
 get_financial_data, get_dividend_info = all_tools
 
+# --- Helper Functions and Parsers ---
+
+# A blocklist of common 4-letter English words that are not stock tickers.
+# This MUST be defined before parse_ticker_from_input and parse_two_tickers.
+COMMON_WORD_BLOCKLIST = [
+    "DOES", "JUST", "WHAT", "WANT", "HOW", "FROM", "WITH", "THIS", "THAT",
+    "YOUR", "THEM", "HAVE", "BEEN", "MORE", "WILL", "ALSO", "INTO", "SOME"
+]
+
+def _get_valid_tickers_from_string(input_str: str) -> list[str]:
+    """
+    Internal helper to sanitize input, find all 4-letter words, filter them against a blocklist,
+    and return a unique list of valid tickers.
+    """
+    # 1. Sanitize the input to handle possessives and punctuation.
+    temp_input = input_str.upper().replace("'S", "")
+    sanitized_input = re.sub(r"[.,?']", "", temp_input)
+    # 2. Find all potential tickers from the clean string.
+    matches = re.findall(r'\b[A-Z]{4}\b', sanitized_input)
+    # 3. Filter out common words and get unique tickers.
+    filtered = [t for t in matches if t not in COMMON_WORD_BLOCKLIST]
+    return list(dict.fromkeys(filtered)) # Return unique tickers
+
 def parse_ticker_from_input(x: dict) -> str:
-    """A simple parser to find the first likely stock ticker in the user's input."""
-    # FIX: The regex was failing if a ticker was followed by punctuation (e.g., "TLKM?").
-    # This new regex looks for a 4-letter word and is not stopped by a trailing question mark.
-    match = re.search(r'\b([A-Z]{4})\b', x["input"].upper().replace('?', ''))
-    if match:
-        ticker = match.group(1)
-        return ticker
+    """A robust parser to find the last likely stock ticker in the user's input."""
+    # Reuses the core parsing logic (_get_valid_tickers_from_string).
+    found_tickers = _get_valid_tickers_from_string(x["input"])
+    if found_tickers:
+        # Return the last match found, which is the most reliable heuristic.
+        return found_tickers[-1]
+
     # If no ticker is found in a specific query, it might be a general question.
     # Return a neutral value that won't trigger an invalid response.
     return "GENERAL"
 
 def parse_two_tickers(x: dict) -> dict:
-    """A simple parser to find two stock tickers for comparison."""
-    # FIX: This logic is now robust. It finds unique tickers and only adds defaults if needed.
-    # This prevents the agent from trying to compare a stock with itself, which causes hallucinations.
-    found_tickers = list(dict.fromkeys(re.findall(r'\b[A-Z]{4}\b', x["input"].upper()))) # Find unique tickers
-    default_tickers = ["BBCA", "BBRI"]
-    while len(found_tickers) < 2:
-        found_tickers.append(default_tickers.pop(0))
-    return {
-        "ticker_1": found_tickers[0],
-        "ticker_2": found_tickers[1],
-        "input": x["input"]
-    }
+    """A robust parser to find two stock tickers for comparison."""
+    # Reuses the core parsing logic (_get_valid_tickers_from_string).
+    unique_tickers = _get_valid_tickers_from_string(x["input"])
+    if len(unique_tickers) < 2:
+        return {"error": "Please provide at least two valid stock tickers for comparison."}
+    else:
+        return {
+            "ticker_1": unique_tickers[0],
+            "ticker_2": unique_tickers[1],
+            "input": x["input"]
+        }
 
 
 # --- 3. DEFINE SPECIALIZED CHAINS FOR EACH TASK ---
@@ -197,14 +219,10 @@ stock_analysis_chain = data_gathering_chain | RunnableBranch(
 )
 
 
-# --- Chain 2: Stock Comparison ---
-
-comparison_data_chain = (
-    (lambda x: x['passthrough']) 
-    | RunnableLambda(parse_two_tickers)
-) | RunnableLambda(
-    # This structure ensures that the parallel tool calls are executed,
-    # and their results are merged back with the original input dictionary.
+# --- Chain 2: Stock Comparison (Helper Chain for Data Fetching) ---
+# This chain takes a dictionary with 'ticker_1' and 'ticker_2' and fetches their financial data.
+# It does NOT perform parsing; parsing happens before this chain is invoked.
+comparison_data_chain = RunnableLambda(
     lambda x: RunnablePassthrough.assign(
         data_1=lambda y: get_financial_data.invoke(y['ticker_1']),
         data_2=lambda y: get_financial_data.invoke(y['ticker_2']),
@@ -212,9 +230,17 @@ comparison_data_chain = (
 )
 
 comparison_prompt = ChatPromptTemplate.from_template(comparison_prompt_template)
-stock_comparison_chain = comparison_data_chain | RunnableLambda(
-    # Only run the LLM part if we have data, not the error string
-    lambda x: (comparison_prompt | llm | StrOutputParser()) if isinstance(x, dict) else x
+# FIX: The comparison chain now checks for the 'error' key from the parser.
+# If the error exists, it returns the error message directly.
+# Otherwise, it proceeds with the data fetching and analysis.
+# The TypeError was caused by not wrapping `parse_two_tickers` in a RunnableLambda.
+stock_comparison_chain = RunnableLambda(
+    lambda x: (
+        (lambda y: y['passthrough'])
+        | RunnableLambda(parse_two_tickers) # Ensure parse_two_tickers is wrapped
+        | RunnableLambda(lambda z: z if 'error' in z else comparison_data_chain.invoke(z))
+        | RunnableLambda(lambda z: z.get("error") if "error" in z else (comparison_prompt | llm | StrOutputParser()).invoke(z))
+    ).invoke(x)
 )
 
 
@@ -225,9 +251,6 @@ general_conversation_chain = (lambda x: x['passthrough']) | qa_prompt | llm | St
 
 # --- Chain 4: Dividend Question ---
 
-# FIX: This chain was failing because the parser was receiving the wrong data structure.
-# The new structure explicitly passes the correct 'input' to the parser and correctly
-# formats the final output string, including converting the yield ratio to a percentage.
 dividend_chain = (
     {
         # Explicitly pass the input string to the parser.
@@ -238,12 +261,15 @@ dividend_chain = (
         "ticker": x['ticker'],
         "info": get_dividend_info.invoke(x['ticker'])
     })
-    | RunnableLambda(lambda x: {
-        "ticker": x['ticker'],
-        "yield_percent": (x['info'].get('dividend_yield_percent') * 100) if x['info'].get('dividend_yield_percent') is not None else 'N/A',
-        "payout": x['info'].get('last_payout_idr', 'N/A')
-    })
-    | (lambda x: f"The dividend yield for {x['ticker']} is {x['yield_percent']:.2f}% with a last payout of Rp {x['payout']:.2f}." if isinstance(x['yield_percent'], float) else f"The dividend yield for {x['ticker']} is {x['yield_percent']}% with a last payout of Rp {x['payout']}.")
+    # FIX: The final formatting step was too complex and error-prone.
+    # This simpler lambda checks for valid data and formats the string correctly.
+    | RunnableLambda(
+        lambda x: (
+            f"The dividend yield for {x['ticker']} is {x['info']['dividend_yield_percent'] * 100:.2f}% with a last payout of Rp {x['info']['last_payout_idr']:.2f}."
+            if isinstance(x.get('info', {}).get('dividend_yield_percent'), (int, float)) and isinstance(x.get('info', {}).get('last_payout_idr'), (int, float))
+            else f"Sorry, I could not retrieve complete dividend data for {x['ticker']}."
+        )
+    )
 )
 
 # --- 4. BUILD THE MAIN ROUTER CHAIN ---

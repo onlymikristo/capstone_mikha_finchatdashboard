@@ -153,8 +153,11 @@ def get_dividend_info(stock_ticker: str) -> dict:
         dividend_data = response.json()['dividend']
 
         return {
-            "dividend_yield_percent": dividend_data['yield'],
-            "last_payout_idr": dividend_data['last_payout']
+            # FIX: The keys were incorrect. Based on the API documentation,
+            # 'yield_ttm' is the trailing twelve months yield, and
+            # 'dividend_ttm' is the trailing twelve months dividend amount.
+            "dividend_yield_percent": dividend_data.get('yield_ttm'),
+            "last_payout_idr": dividend_data.get('dividend_ttm')
         }
 
     except Exception as e:

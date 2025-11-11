@@ -121,7 +121,9 @@ get_financial_data, get_dividend_info = all_tools
 
 def parse_ticker_from_input(x: dict) -> str:
     """A simple parser to find the first likely stock ticker in the user's input."""
-    match = re.search(r'\b([A-Z]{4})\b', x["input"].upper())
+    # FIX: The regex was failing if a ticker was followed by punctuation (e.g., "TLKM?").
+    # This new regex looks for a 4-letter word and is not stopped by a trailing question mark.
+    match = re.search(r'\b([A-Z]{4})\b', x["input"].upper().replace('?', ''))
     if match:
         ticker = match.group(1)
         return ticker
@@ -223,12 +225,25 @@ general_conversation_chain = (lambda x: x['passthrough']) | qa_prompt | llm | St
 
 # --- Chain 4: Dividend Question ---
 
+# FIX: This chain was failing because the parser was receiving the wrong data structure.
+# The new structure explicitly passes the correct 'input' to the parser and correctly
+# formats the final output string, including converting the yield ratio to a percentage.
 dividend_chain = (
-    (lambda x: x['passthrough']) # Start with the input
-    | RunnablePassthrough.assign(ticker=parse_ticker_from_input) # Find the ticker
-    # The tool is called directly, and the result is formatted into a string.
-    # The tool's own error handling will manage invalid tickers.
-    | (lambda x: f"The dividend yield for {x['ticker']} is {get_dividend_info.invoke(x['ticker']).get('dividend_yield_percent', 'N/A')}% with a last payout of Rp {get_dividend_info.invoke(x['ticker']).get('last_payout_idr', 'N/A')}.")
+    {
+        # Explicitly pass the input string to the parser.
+        "ticker": (lambda x: parse_ticker_from_input({'input': x['passthrough']['input']})),
+        "passthrough": (lambda x: x['passthrough'])
+    }
+    | RunnableLambda(lambda x: {
+        "ticker": x['ticker'],
+        "info": get_dividend_info.invoke(x['ticker'])
+    })
+    | RunnableLambda(lambda x: {
+        "ticker": x['ticker'],
+        "yield_percent": (x['info'].get('dividend_yield_percent') * 100) if x['info'].get('dividend_yield_percent') is not None else 'N/A',
+        "payout": x['info'].get('last_payout_idr', 'N/A')
+    })
+    | (lambda x: f"The dividend yield for {x['ticker']} is {x['yield_percent']:.2f}% with a last payout of Rp {x['payout']:.2f}." if isinstance(x['yield_percent'], float) else f"The dividend yield for {x['ticker']} is {x['yield_percent']}% with a last payout of Rp {x['payout']}.")
 )
 
 # --- 4. BUILD THE MAIN ROUTER CHAIN ---
